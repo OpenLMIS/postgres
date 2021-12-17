@@ -1,3 +1,3 @@
-FROM debezium/postgres:9.6-alpine
+FROM debezium/postgres:12
 
 COPY init/ /docker-entrypoint-initdb.d
