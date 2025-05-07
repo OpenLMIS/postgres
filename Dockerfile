@@ -1,3 +1,3 @@
-FROM debezium/postgres:12
+FROM debezium/postgres:14
 
 COPY init/ /docker-entrypoint-initdb.d
