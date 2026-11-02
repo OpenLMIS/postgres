@@ -1,0 +1,7 @@
+# Helper image for in-place `pg_upgrade --link` of a 14 data directory created by openlmis/postgres:14-debezium.
+# Based on the 17 image so that initdb of the new cluster picks up the same postgresql.conf.sample (wal_level=logical).
+FROM openlmis/postgres:17
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends postgresql-14 postgresql-14-postgis-3 postgresql-14-postgis-3-scripts \
+    && rm -rf /var/lib/apt/lists/*
