@@ -65,6 +65,8 @@ November 2026 (OLMIS-8422). Every figure is a single run, not an average.
   indexes must be rebuilt after a self-hosted upgrade (path A, step 8). RDS kept the same glibc in the test (no
   reindex needed), but that depends on the OS under the engine version: compare the collation version
   from the baseline (section 2) after every upgrade and reindex when it differs.
+- `max_replication_slots` / `max_wal_senders`: 4 on the Debezium-based 14 image, 10 (the PostgreSQL
+  defaults) on 17 — expected when comparing `show all` before and after.
 - Logical decoding plugins: the 17 image ships only the built-in `pgoutput`, which the SolDevelo reporting
   stack uses. The legacy ref-distro reporting stack (`reporting/`, NiFi, Debezium 1.5) registers its
   connectors with `plugin.name=wal2json` and cannot run against this image — switch those connectors to
@@ -145,8 +147,11 @@ The existing volume's real name carries the compose project prefix, e.g. `openlm
 ref-distro's `olmis-db` — take it from `docker volume ls` (`<old-volume>` below). `<new-volume>` is any new
 name, e.g. `openlmis-ref-distro_olmis-db-17`.
 
-1. Stop the application services and the reporting stack connector (section 7), then drop the slot —
-   the form below is a no-op when the stack was never attached:
+1. Stop the application services but not the database —
+   `docker compose stop $(docker compose config --services | grep -vxE 'db|consul|log|redis')` stops
+   everything the compose file defines except the database and its infrastructure — and the reporting
+   stack connector (section 7), then drop the slot; the form below is a no-op when the stack was never
+   attached:
    `docker compose exec db psql -U postgres -d open_lmis -c "select pg_drop_replication_slot(slot_name) from pg_replication_slots where slot_name = 'debezium_reporting';"`.
 2. Stop the database container (`docker compose stop db`). The old volume is the rollback; nothing below
    modifies its data (`pg_upgrade` starts and stops the old postmaster, so `pg_control`, `pg_wal/` and
@@ -206,8 +211,13 @@ name, e.g. `openlmis-ref-distro_olmis-db-17`.
 
    Start the database only: `docker compose -f docker-compose.yml -f docker-compose.pg17.yml up -d db`
    (consul comes up with it through `depends_on`). The entrypoint logs `Skipping initialization` because
-   the directory already holds a cluster. Use the same `-f … -f …` pair for every later `docker compose`
-   command of this deployment; the rollback is to leave the override out.
+   the directory already holds a cluster. If the reporting stack is attached, keep its overlay in the
+   list as well (`-f docker-compose.yml -f docker-compose.reporting-stack.yml -f docker-compose.pg17.yml`,
+   plus `docker-compose.reporting-dev.yml` where it is used): without it the database leaves the
+   `reporting-shared` network and loses the `olmis-db` alias, so Kafka Connect cannot reach it. The least
+   error-prone form is `COMPOSE_FILE=docker-compose.yml:docker-compose.reporting-stack.yml:docker-compose.pg17.yml`
+   in `.env`, after which every plain `docker compose …` command below works unchanged. Use the same file
+   list for every later command of this deployment; the rollback is to leave the `pg17` override out.
 5. Update the extensions:
    `docker compose exec db psql -U postgres -d open_lmis -c 'alter extension postgis update; alter extension "uuid-ossp" update;'`
    (and `postgis_topology`, `postgis_raster`, `fuzzystrmatch`, `pg_buffercache`, `pgstattuple` where
@@ -225,8 +235,14 @@ name, e.g. `openlmis-ref-distro_olmis-db-17`.
    warn about it after an upgrade from 14 (`datcollversion` is written by the new `initdb`), so do it
    unconditionally. Then
    `docker compose exec db psql -U postgres -d open_lmis -c 'alter database open_lmis refresh collation version;'`.
-9. Re-attach the reporting stack (section 7), start the application services, run the verification
-   (section 8). Delete the old volume (`docker volume rm <old-volume>`) only after the verification.
+9. Re-attach the reporting stack (section 7), start the application services (`docker compose up -d`),
+   run the verification (section 8). With the reporting-stack overlay the start re-runs
+   `reporting-stack-init`, which sets the publication back to the table list in
+   `reporting-stack/init-db.sql` (`ALTER PUBLICATION … SET TABLE`): a table added by hand drops out of
+   CDC silently while `verify-cdc` and `reconcile` stay green, so compare
+   `select count(*) from pg_publication_tables where pubname = 'dbz_publication'` with the baseline after
+   the start and keep every addition in `init-db.sql`. Delete the old volume
+   (`docker volume rm <old-volume>`) only after the verification.
 
 Rollback: stop the services, leave the override out, set `OL_POSTGRES_VERSION=14-debezium` and start
 again; the old volume has not changed. Everything written on 17 after the cutover is lost — roll back
@@ -459,6 +475,11 @@ The stack (Debezium on Kafka Connect, `pgoutput`, slot `debezium_reporting`, pub
 `dbz_publication`) must be stopped cleanly before and re-attached after. The full runbook is in the
 reporting-stack repository (`docs/runbook-source-upgrade.md`); the short version:
 
+A demo-style instance running `spring_profiles_active=demo-data,refresh-db` must be switched to
+`production` (after the demo data is loaded) before the stack is attached, and stay so through the
+upgrade: every start under `refresh-db` recreates the schemas, which floods the connector with deletes and
+inserts and drops the recreated tables from the publication.
+
 Before the upgrade, with application writes already stopped:
 
 1. Stop the connect watchdog — from the reporting-stack repository root,
@@ -481,7 +502,8 @@ After the upgrade, before application writes resume:
 6. Register the connector with `DEBEZIUM_SNAPSHOT_MODE=no_data` (`make register-connector`): the new slot
    is created immediately, no snapshot runs, streaming starts from now. Measured: 13–21 seconds.
 7. Resume writes, start the watchdog and the DAG, run `make reconcile`, then `make register-connector` once
-   more with the default snapshot mode so that the stored config is back to `when_needed`.
+   more with the default snapshot mode so that the stored config is back to `when_needed`. After the
+   application is up, re-check the publication table count (path A, step 9).
 
 If writes could not be blocked between steps 3 and 6, use `FORCE=1 SKIP_DBT=1 make recover-slot` instead
 of step 6: it re-snapshots every captured table (30–60 minutes for the Malawi tables); run
