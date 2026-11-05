@@ -58,8 +58,9 @@ November 2026 (OLMIS-8422). Every figure is a single run, not an average.
   only deprecated in PostgreSQL 18.
 - Extensions: PostGIS (facility locations, geographic zone boundaries) and `uuid-ossp`. A major upgrade
   never upgrades extensions; run the extension updates after the upgrade (below).
-- `max_connections`: RDS 17 reserves a few slots for the new `rds_reserved` role
-  (`rds.rds_reserved_connections`, default 4). Account for it if the setting is tight.
+- `max_connections`: RDS reserves a few connections for its `rds_reserved` role
+  (`rds.rds_reserved_connections`, default 4, present on 14 as well — not an upgrade change). Account for
+  it if the setting is tight.
 - Collation: Docker images changed the Debian release (bullseye → trixie, glibc 2.31 → 2.41), so text
   indexes must be rebuilt after a self-hosted upgrade (path A, step 8). RDS kept the same glibc in the test (no
   reindex needed), but that depends on the OS under the engine version: compare the collation version
@@ -106,7 +107,9 @@ checksums from section 8 for the big ones. In Docker run the block with
 
 Then:
 
-1. Take a backup (RDS snapshot or a copy of the data volume) and test that you can restore it.
+1. Take a backup (RDS snapshot or a copy of the data volume) and test that you can restore it (restoring
+   a 142 GB RDS snapshot into a new `db.m5.2xlarge` took 8 min 40 s to `available`; the volume then
+   loads lazily, section 9).
 2. Update PostGIS to the newest version available on the **current** major
    (`alter extension postgis update;` plus `postgis_topology`, `postgis_raster`, `postgis_tiger_geocoder`
    if installed). RDS requires this when skipping majors; on the Docker `14-debezium` image it is a no-op
@@ -123,7 +126,7 @@ Then:
 | A. Docker `pg_upgrade` | link mode ~47 min (+ ~11 min analyze and reindex); copy mode adds the file copy (est. ~15 min for 121 GB, not measured at that size) | ~1 h | copy mode keeps the old volume intact; link mode: no data copy, old cluster unusable after the new one starts |
 | B. Docker dump/restore | ~4.8 h | ~4.8 h | 109 min dump + 136 min restore of the large objects alone; ~45 min without large objects |
 | C. Docker logical replication | ~3 min | ~45 min | 37 min initial sync while production runs; manual copy of large objects and sequences |
-| RDS in-place (Modify) | ~35 min | ~47 min to `available` | RDS runs `ANALYZE` itself; extensions updated in seconds afterwards |
+| RDS in-place (Modify) | ~35 min | ~44–47 min to `available` | planner statistics are not carried over: `vacuumdb --analyze-in-stages` after `available` (~30 min on the freshly upgraded 142 GB instance); extensions updated in seconds |
 | RDS Blue/Green | ~13 s (switchover 72 s) | ~1 h deployment | no large-object writes and no reporting stack during the deployment; `REPLICA IDENTITY FULL` on tables without a primary key |
 
 Demo-size databases (ref-distro, ~200 MB) upgrade with path A in seconds.
@@ -351,28 +354,80 @@ RDS runs `pg_upgrade` in link mode. Measured on `db.m5.2xlarge`, 142 GB, 21 mill
 run before/after). AWS warns that millions of large objects need memory: at least 32 GB RAM for
 25–30 million objects.
 
-1. Prechecks (section 2). `rdsadmin` extensions, prepared transactions, `reg*` columns and views on
-   `pg_stat_activity` fail the precheck; the Debezium slot fails it too — drop it (section 7). A read
-   replica is upgraded together with the primary and extends the outage; promote or delete it before and
-   recreate it after.
-2. Update PostGIS on 14 (`alter extension postgis update` etc.).
-3. Create the 17 parameter group. **Nothing is carried over**: set `rds.logical_replication = 1`,
-   `password_encryption = md5` (if still needed), `rds.force_ssl`, `max_slot_wal_keep_size` (2 GB in the
-   reporting-stack docs), `min_wal_size` and anything else `describe-db-parameters --source user` shows
-   on the 14 group. `max_wal_senders` is raised by RDS to 35 if set lower.
+1. Prechecks: section 2 plus the RDS-specific ones. RDS refuses the upgrade (and leaves the instance on
+   14) when any of these returns rows; the Debezium slot fails it too — drop it (section 7):
+
+   ```sql
+   select count(*) from pg_prepared_xacts;                                  -- must be 0
+   select n.nspname, c.relname, a.attname from pg_attribute a              -- reg* columns (none in OpenLMIS)
+     join pg_class c on c.oid = a.attrelid join pg_namespace n on n.oid = c.relnamespace
+    where a.atttypid in ('regproc'::regtype, 'regprocedure'::regtype, 'regoper'::regtype,
+                         'regoperator'::regtype, 'regconfig'::regtype, 'regdictionary'::regtype)
+      and c.relkind = 'r' and n.nspname not in ('pg_catalog', 'information_schema');
+   select schemaname, viewname from pg_views                                -- views on pg_stat_activity
+    where definition ilike '%pg_stat_activity%';
+   select extname from pg_extension where extname like 'rdsadmin%';        -- rdsadmin extensions
+   ```
+
+   Then, with the AWS CLI: the target must be in
+   `aws rds describe-db-engine-versions --engine postgres --engine-version <current 14.x> --query 'DBEngineVersions[0].ValidUpgradeTarget[?IsMajorVersionUpgrade].EngineVersion'`
+   (from 14.22: 17.9, 17.10, 17.11 among others), and
+   `aws rds describe-db-instances --db-instance-identifier <id> --query 'DBInstances[0].BackupRetentionPeriod'`
+   must be greater than 0 — otherwise RDS takes no pre-upgrade snapshot and there is nothing to roll
+   back to. A read replica is upgraded together with the primary and extends the outage; promote or
+   delete it before and recreate it after.
+2. Update PostGIS on 14 (`alter extension postgis update` etc.; 3.4.3 → 3.4.6 took 6 seconds).
+3. Create the 17 parameter group. **Nothing is carried over**:
+
+   ```bash
+   aws rds create-db-parameter-group --db-parameter-group-name <pg17> --db-parameter-group-family postgres17 --description "OpenLMIS PostgreSQL 17"
+   aws rds describe-db-parameters --db-parameter-group-name <pg14> --source user --query 'Parameters[].[ParameterName,ParameterValue]' --output text
+   aws rds modify-db-parameter-group --db-parameter-group-name <pg17> --parameters \
+     "ParameterName=rds.logical_replication,ParameterValue=1,ApplyMethod=pending-reboot" \
+     "ParameterName=max_slot_wal_keep_size,ParameterValue=2048,ApplyMethod=immediate"
+   ```
+
+   Repeat every value the second command lists (`rds.logical_replication`, `password_encryption = md5` if
+   still needed, `rds.force_ssl`, `min_wal_size`, …). Two things that list does not tell you: the
+   `postgres17` family defaults to `rds.force_ssl = 1` (`postgres14`: 0), so an instance that never set it
+   rejects every connection without TLS after the upgrade — set it to 0 explicitly if any client connects
+   without SSL (`--source user` hides values equal to the family default, so compare the 17 group with
+   `describe-db-parameters` without the filter); and if the 14 group has no `max_slot_wal_keep_size`
+   (unlimited), this is the moment to add the 2 GB the reporting-stack docs require — it changes
+   behaviour (the slot is invalidated instead of filling the storage). `max_wal_senders` is raised by RDS
+   to 35 if set lower.
 4. `aws rds modify-db-instance --db-instance-identifier <id> --engine-version 17.11 --db-parameter-group-name <pg17>
-   --allow-major-version-upgrade --apply-immediately` (17.5/17.6 leave standard support in October 2026;
-   use the newest minor). Watch `describe-events` (`pre-check started/finished`, `DB instance shutdown`,
-   `Backing up`, `available`) and the logs `pg_upgrade_precheck.log`, `pg_upgrade_internal.log`,
-   `pg_upgrade_server.log` under `describe-db-log-files`.
+   --allow-major-version-upgrade --apply-immediately` (the newest minor from step 1; 17.5/17.6 leave
+   standard support in October 2026). RDS takes the pre-upgrade snapshot
+   (`rds:preupgrade-<id>-14-22-to-17-11-<n>`, type `automated`), shuts the instance down, runs
+   `pg_upgrade`, starts 17 and takes the post-upgrade backup. Progress: the instance status is
+   `upgrading` and a `select 1` probe every few seconds shows the outage; `describe-events` reports
+   `DB instance shutdown` first and `The engine version upgrade started` only near the end, so do not
+   wait for that event. Logs under `describe-db-log-files`: `error/pg_upgrade_internal.log.<n>` and
+   `error/pg_upgrade_server.log.<n>` (`pg_upgrade_precheck.log` appears only when the precheck fails).
+   Measured twice on the same data: 35 min without connections, 44 and 47 min to `available`.
 5. After `available`: `select postgis_extensions_upgrade();` plus `alter extension` for the others
-   (7 seconds). RDS has already run `ANALYZE` on every table. Verify the parameter group is `in-sync`
-   (no reboot was needed in the test), `show wal_level` etc., and that `pg_collation_actual_version` still
-   matches the baseline — reindex if it does not.
+   (seconds). Then, **before the application starts**,
+   `vacuumdb -h <endpoint> -U <master user> --all --analyze-in-stages`: RDS does not carry planner
+   statistics over and does not analyze for you (15 minutes after the upgrade `pg_stats` covered 4 of 266
+   tables in the test); it took 30 minutes on the 142 GB instance straight after the upgrade, on the
+   lazily loaded volume. Verify the parameter group is `in-sync` (no reboot was needed in the test),
+   `show wal_level` etc., and that `pg_collation_actual_version` still matches the baseline (it did in
+   both tests: `2.26-59.amzn2` under 14 and 17). If it differs: `reindexdb -h <endpoint> -U <master user> --all -j 4`
+   from a client and `alter database <db> refresh collation version;` as in path A step 8 (over the
+   network; the Docker test needed 8 minutes for 460 indexes on 121 GB).
 6. Re-attach the reporting stack (section 7), verification (section 8).
 
-Rollback: restore the snapshot RDS took before the upgrade into a new instance and repoint the
-application; the upgraded instance cannot be downgraded.
+Rollback: restore the automated pre-upgrade snapshot
+(`aws rds describe-db-snapshots --db-instance-identifier <id> --snapshot-type automated`, name
+`rds:preupgrade-…`) into a new instance (8 min 40 s to `available` for 142 GB on `db.m5.2xlarge`) and
+repoint the application, or swap the identifiers (`modify-db-instance --new-db-instance-identifier`) so
+that the endpoint stays; the upgraded instance cannot be downgraded. That snapshot is automated: it expires
+with the retention period and is deleted together with the instance, so copy it to a manual one right
+after `available` (`aws rds copy-db-snapshot`) and keep it until the verification has passed. Every write
+made on 17 is lost by the rollback — decide go/no-go before the application resumes writes; afterwards fix
+forward on 17 rather than back. The reporting stack must be re-attached with a full re-snapshot after a
+rollback (section 7, `recover-slot`): ClickHouse already holds changes the restored database never saw.
 
 #### Blue/Green deployment (13 seconds of switchover, strict preconditions)
 
@@ -406,8 +461,10 @@ reporting-stack repository (`docs/runbook-source-upgrade.md`); the short version
 
 Before the upgrade, with application writes already stopped:
 
-1. Stop the connect watchdog (`docker compose stop connect-watchdog`) — it re-registers a missing
-   connector within a minute and will otherwise start a full snapshot the moment the database is back.
+1. Stop the connect watchdog — from the reporting-stack repository root,
+   `docker compose --env-file .env -f compose/docker-compose.yml stop connect-watchdog` (the compose file
+   lives in `compose/`, a bare `docker compose stop` finds nothing). It re-registers a missing connector
+   within a minute and will otherwise start a full snapshot the moment the database is back.
 2. Pause the Airflow DAG `platform_refresh`.
 3. Wait until the slot has no lag, then stop the connector and reset its offsets:
    `PUT /connectors/openlmis-postgres-cdc/stop`, wait until `/status` reports `STOPPED` (stop is
@@ -422,7 +479,7 @@ After the upgrade, before application writes resume:
 5. Check `wal_level = logical` and the other CDC parameters on the new cluster, and that the publication
    and the heartbeat/signal tables are there; re-apply the CDC init SQL if not (it is idempotent).
 6. Register the connector with `DEBEZIUM_SNAPSHOT_MODE=no_data` (`make register-connector`): the new slot
-   is created immediately, no snapshot runs, streaming starts from now. Measured: 21 seconds.
+   is created immediately, no snapshot runs, streaming starts from now. Measured: 13–21 seconds.
 7. Resume writes, start the watchdog and the DAG, run `make reconcile`, then `make register-connector` once
    more with the default snapshot mode so that the stored config is back to `when_needed`.
 
