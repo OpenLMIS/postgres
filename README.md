@@ -22,12 +22,15 @@ Debian *testing*. `openlmis/postgres:17` is published with the alias `17-debeziu
 | `14-debezium` | `debezium/postgres:14` (Debian bullseye) | 14.x | 3.5 |
 | `12-debezium` | `debezium/postgres:12` (Debian bullseye) | 12.x | 3.x |
 
-Build and publish (both tags, so that the alias stays in sync):
+Build and publish (both tags, so that the alias stays in sync). The upgrade helper
+`openlmis/postgres-upgrade:14-to-17` (section 3) is not published on Docker Hub: build it locally from this
+repository, after the image, because it starts `FROM openlmis/postgres:17`:
 
 ```bash
 docker build -t openlmis/postgres:17 .
 docker tag openlmis/postgres:17 openlmis/postgres:17-debezium
 docker push openlmis/postgres:17 && docker push openlmis/postgres:17-debezium
+docker build -t openlmis/postgres-upgrade:14-to-17 -f Dockerfile.upgrade .
 ```
 
 Full configuration details (environment variables, `POSTGRES_INITDB_ARGS`, etc.) are in the official image docs.
@@ -86,16 +89,28 @@ select schemaname||'.'||tablename from pg_tables t                        -- tab
  where schemaname not in ('pg_catalog','information_schema')
    and not exists (select 1 from pg_constraint c join pg_class r on r.oid=c.conrelid
                    join pg_namespace n on n.oid=r.relnamespace
-                   where c.contype='p' and n.nspname=t.schemaname and r.relname=t.tablename);
+                   where c.contype='p' and n.nspname=t.schemaname and r.relname=t.tablename)
+ order by 1;
 select schemaname, sequencename, last_value from pg_sequences order by 1,2;
+select n.nspname||'.'||c.relname,                                         -- row counts of all tables
+       (xpath('/row/c/text()', query_to_xml(format('select count(*) c from %I.%I', n.nspname, c.relname),
+                                            false, true, '')))[1]::text::bigint
+  from pg_class c join pg_namespace n on n.oid = c.relnamespace
+ where c.relkind = 'r' and n.nspname not in ('pg_catalog','information_schema') order by 1;
 ```
+
+The row counts take seconds on a demo database and minutes on a production-size one (it is a sequential
+scan of every table); on large databases count the application tables you care about and add the content
+checksums from section 8 for the big ones. In Docker run the block with
+`docker compose exec db psql -U postgres -d open_lmis -f -` (paste, then `Ctrl-D`) or `-c "..."` per query.
 
 Then:
 
 1. Take a backup (RDS snapshot or a copy of the data volume) and test that you can restore it.
 2. Update PostGIS to the newest version available on the **current** major
    (`alter extension postgis update;` plus `postgis_topology`, `postgis_raster`, `postgis_tiger_geocoder`
-   if installed). RDS requires this when skipping majors.
+   if installed). RDS requires this when skipping majors; on the Docker `14-debezium` image it is a no-op
+   (the image ships only PostGIS 3.5.0, `version "3.5.0" of extension "postgis" is already installed`).
 3. Detach the reporting stack (section 7): the Debezium replication slot blocks RDS upgrades and
    Blue/Green creation, and it does not survive `pg_upgrade` anyway. The publication and the
    `reporting_heartbeat` / `debezium_signal` tables survive every path (a whole-database `pg_dump` includes
@@ -127,9 +142,12 @@ The existing volume's real name carries the compose project prefix, e.g. `openlm
 ref-distro's `olmis-db` — take it from `docker volume ls` (`<old-volume>` below). `<new-volume>` is any new
 name, e.g. `openlmis-ref-distro_olmis-db-17`.
 
-1. Stop the application services and the reporting stack connector, drop the slot:
-   `select pg_drop_replication_slot('debezium_reporting');` (section 7).
-2. Stop the database container. The old volume is the rollback; nothing below modifies it.
+1. Stop the application services and the reporting stack connector (section 7), then drop the slot —
+   the form below is a no-op when the stack was never attached:
+   `docker compose exec db psql -U postgres -d open_lmis -c "select pg_drop_replication_slot(slot_name) from pg_replication_slots where slot_name = 'debezium_reporting';"`.
+2. Stop the database container (`docker compose stop db`). The old volume is the rollback; nothing below
+   modifies its data (`pg_upgrade` starts and stops the old postmaster, so `pg_control`, `pg_wal/` and
+   `postmaster.opts` get a new mtime, nothing else).
 3. Run the upgrade with the helper image built from `Dockerfile.upgrade` (the 17 image plus the 14 binaries
    and PostGIS for 14; the 17 side is pinned to the image's PostGIS version, the 14 side gets whichever 3.x
    PGDG ships at build time — `pg_upgrade` only needs `postgis-3` to exist on both sides, the catalog is
@@ -148,9 +166,9 @@ name, e.g. `openlmis-ref-distro_olmis-db-17`.
      LOC=$(echo "$ctl" | sed -n "s/^LC_COLLATE: *//p")
      cd /tmp
      gosu postgres $NEWBIN/initdb -D $NEW --locale="$LOC" --encoding=UTF8 $CK --username=postgres
-     gosu postgres $NEWBIN/pg_upgrade -j $(nproc) -b $OLDBIN -B $NEWBIN -d $OLD -D $NEW \
+     gosu postgres $NEWBIN/pg_upgrade -b $OLDBIN -B $NEWBIN -d $OLD -D $NEW \
        -o "-c shared_preload_libraries=" --check
-     gosu postgres $NEWBIN/pg_upgrade -j $(nproc) -b $OLDBIN -B $NEWBIN -d $OLD -D $NEW \
+     gosu postgres $NEWBIN/pg_upgrade -b $OLDBIN -B $NEWBIN -d $OLD -D $NEW \
        -o "-c shared_preload_libraries="
      cp $OLD/postgresql.auto.conf $NEW/
      grep -v "^host replication .* 0\.0\.0\.0/0 trust" $OLD/pg_hba.conf > $NEW/pg_hba.conf'
@@ -159,32 +177,57 @@ name, e.g. `openlmis-ref-distro_olmis-db-17`.
    `-o "-c shared_preload_libraries="` (empty) is required: the 14-debezium image's `postgresql.conf` preloads
    `decoderbufs,wal2json`, which the upgrade image does not ship, so the old postmaster would not start.
    `--check` runs the prechecks (prepared transactions, required libraries including `postgis-3`) without
-   touching anything. The new `postgresql.conf` comes from the 17 image (`wal_level = logical`);
+   touching anything; run it every time, right before the real call. No `-j`: OpenLMIS is one database in
+   one tablespace, so parallel jobs gain nothing here, and with `-j > 1` the parallel restore raced against
+   `pg_upgrade` recreating the `postgres` database with its old OID (`FATAL: database "postgres" does not
+   exist … It seems to have just been dropped`) in 8 of 8 attempts on a 16-core host; one of those runs
+   still printed `Upgrade Complete` while a relation file was missing from the new cluster. Both calls
+   must end without a `*failure*` line and the second with `Upgrade Complete`; if the real call fails, do
+   not rerun it on the half-written directory — recreate `<new-volume>` (copy mode) or restore the volume
+   copy (link mode) first. The new `postgresql.conf` comes from the 17 image (`wal_level = logical`);
    `postgresql.auto.conf` (`ALTER SYSTEM` settings) and `pg_hba.conf` are copied by hand — `pg_upgrade`
    does not carry them over. The copy drops the `host replication postgres 0.0.0.0/0 trust` line that the
    Debezium base appended to every 14 cluster: it allows a passwordless `pg_basebackup` from any host that
    reaches the port, and Debezium does not need it (a logical replication connection is matched by the
    `host all all all` line, not by the `replication` keyword).
-4. Switch the deployment to the 17 image and the new volume: `OL_POSTGRES_VERSION=17` and, in
-   `docker-compose.yml`, point the `olmis-db` volume at the new one (`volumes: olmis-db: name: <new-volume>`,
-   or rename the key). Start the database only; the entrypoint logs `Skipping initialization` because the
-   directory already holds a cluster.
-5. Update the extensions: `alter extension postgis update; alter extension "uuid-ossp" update;`
+4. Switch the deployment to the 17 image and the new volume without editing the tracked
+   `docker-compose.yml`: set `OL_POSTGRES_VERSION=17` in `.env` and add an override file next to it:
+
+   ```yaml
+   # docker-compose.pg17.yml
+   volumes:
+     olmis-db:
+       name: <new-volume>
+       external: true
+   ```
+
+   Start the database only: `docker compose -f docker-compose.yml -f docker-compose.pg17.yml up -d db`
+   (consul comes up with it through `depends_on`). The entrypoint logs `Skipping initialization` because
+   the directory already holds a cluster. Use the same `-f … -f …` pair for every later `docker compose`
+   command of this deployment; the rollback is to leave the override out.
+5. Update the extensions:
+   `docker compose exec db psql -U postgres -d open_lmis -c 'alter extension postgis update; alter extension "uuid-ossp" update;'`
    (and `postgis_topology`, `postgis_raster`, `fuzzystrmatch`, `pg_buffercache`, `pgstattuple` where
    installed), then `select postgis_full_version();` must report no pending upgrade.
-6. `vacuumdb --all --analyze-in-stages` (statistics are not carried over; 3 minutes for 121 GB).
-7. Check the settings that must have survived: `show wal_level;` (`logical`), `max_connections`,
-   `password_encryption`, `max_slot_wal_keep_size`, and that `pg_publication` still lists
-   `dbz_publication`.
-8. Rebuild the indexes: `reindexdb --all -j $(nproc)` (8 minutes for 460 indexes / 121 GB). The image
-   moved from glibc 2.31 to 2.41 and PostgreSQL cannot warn about it after an upgrade from 14
-   (`datcollversion` is written by the new `initdb`), so do it unconditionally. Then
-   `alter database open_lmis refresh collation version;`.
+6. `docker compose exec db vacuumdb -U postgres --all --analyze-in-stages` (statistics are not carried
+   over; 3 minutes for 121 GB). All client tools in the container need `-U postgres`, otherwise they
+   connect as `root` and fail with `role "root" does not exist`.
+7. Check the settings that must have survived, against the baseline:
+   `docker compose exec db psql -U postgres -d open_lmis -c 'show wal_level' -c 'show max_connections' -c 'show password_encryption' -c 'show max_slot_wal_keep_size' -c 'select pubname from pg_publication'`
+   — `wal_level` must be `logical`, the rest equal to the baseline; `pg_publication` lists
+   `dbz_publication` only if the reporting stack was attached before the upgrade (empty otherwise, as in
+   the baseline).
+8. Rebuild the indexes: `docker compose exec db sh -c 'reindexdb -U postgres --all -j $(nproc)'`
+   (8 minutes for 460 indexes / 121 GB). The image moved from glibc 2.31 to 2.41 and PostgreSQL cannot
+   warn about it after an upgrade from 14 (`datcollversion` is written by the new `initdb`), so do it
+   unconditionally. Then
+   `docker compose exec db psql -U postgres -d open_lmis -c 'alter database open_lmis refresh collation version;'`.
 9. Re-attach the reporting stack (section 7), start the application services, run the verification
    (section 8). Delete the old volume (`docker volume rm <old-volume>`) only after the verification.
 
-Rollback: point the compose back at the old volume and `OL_POSTGRES_VERSION=14-debezium`; nothing in it has
-changed.
+Rollback: stop the services, leave the override out, set `OL_POSTGRES_VERSION=14-debezium` and start
+again; the old volume has not changed. Everything written on 17 after the cutover is lost — roll back
+before resuming writes, or export those changes first.
 
 #### Variant: link mode in the same volume (no second volume, no data copy)
 
@@ -194,9 +237,16 @@ is no disk for a second volume or the copy time is not acceptable (link mode too
 Malawi copy, dominated by the schema restore of 21 million large objects). Differences from the steps above:
 
 - Before step 3, keep a copy of the volume if you can afford the disk (`cp -a` of 121 GB took 11 minutes on
-  gp3): it is the only rollback once the new cluster has started. Then re-layout the volume, once, in a
-  throwaway container — the old data directory must end up at `<volume>/14/data` (mode 0700, or the old
-  postmaster refuses to start) and an empty `<volume>/17/data` must exist:
+  gp3): it is the only rollback once the new cluster has started:
+
+  ```bash
+  docker volume create <copy>
+  docker run --rm -v <volume>:/from:ro -v <copy>:/to alpine cp -a /from/. /to/
+  ```
+
+  Then re-layout the volume, once, in a throwaway container — the old data directory must end up at
+  `<volume>/14/data` (mode 0700, or the old postmaster refuses to start) and an empty `<volume>/17/data`
+  must exist:
 
   ```bash
   docker run --rm -v <volume>:/v openlmis/postgres:17 sh -c \
@@ -205,17 +255,37 @@ Malawi copy, dominated by the schema restore of 21 million large objects). Diffe
 
 - Step 3 runs with `-v <volume>:/var/lib/postgresql`, `OLD=/var/lib/postgresql/14/data`,
   `NEW=/var/lib/postgresql/17/data` and `--link` on both `pg_upgrade` calls.
-- Step 4: keep the volume mounted at `/var/lib/postgresql` and set `environment: PGDATA=/var/lib/postgresql/17/data`
-  on the `db` service instead of switching volumes (the image declares `/var/lib/postgresql/data` as a
-  volume, so an empty `data` directory and an anonymous volume appear next to `14/` and `17/` — harmless).
-- Step 9: delete the old cluster with `rm -rf <volume>/14/data` (what the `delete_old_cluster.sh` that
-  `pg_upgrade` prints would do). Optionally return to the stock layout afterwards: stop the database,
-  `cd <volume> && mv 17/data/* . && rm -rf 14 17 data` (same filesystem, instant), drop the `PGDATA`
-  override and mount the volume at `/var/lib/postgresql/data` again.
+- Step 4: keep the volume and move the data directory instead of switching volumes. The override must
+  *replace* the stock mount (`!override`, Compose ≥ 2.24), otherwise the volume is mounted twice:
+
+  ```yaml
+  # docker-compose.pg17.yml (link mode)
+  services:
+    db:
+      environment:
+        PGDATA: /var/lib/postgresql/17/data
+      volumes: !override
+        - olmis-db:/var/lib/postgresql
+  ```
+
+  Remove the old `db` container before starting (`docker compose rm -sf db`, then the `up -d db` from
+  step 4): Compose otherwise carries the previous container's mount for the image's
+  `VOLUME /var/lib/postgresql/data` over, and `docker inspect` shows the volume root mounted there as
+  well. PostgreSQL runs from `17/data` either way (`show data_directory`), and an empty root-owned `data`
+  directory next to `14/` and `17/` is normal.
+- Step 9: delete the old cluster in a throwaway container:
+  `docker run --rm -v <volume>:/v openlmis/postgres:17 sh -c 'rm -rf /v/14/data'` (what the
+  `delete_old_cluster.sh` that `pg_upgrade` prints would do). Optionally return to the stock layout
+  afterwards: stop the database,
+  `docker run --rm -v <volume>:/v openlmis/postgres:17 sh -c 'cd /v && mv 17/data/* . && rm -rf 14 17 data'`
+  (same filesystem, instant; the data directory holds no dot files), drop the override and start with the
+  stock compose file again.
 - Rollback before the new cluster has started: `pg_upgrade` only renamed `14/data/global/pg_control` to
   `pg_control.old`; rename it back and start the 14 image with the volume at `/var/lib/postgresql` and
   `PGDATA=/var/lib/postgresql/14/data` (the stock mount would see an empty `data` root and refuse to
-  start). After the new cluster has started: restore the copy of the volume.
+  start). After the new cluster has started: stop the database and restore the copy —
+  `docker run --rm -v <copy>:/from:ro -v <volume>:/to alpine sh -c 'find /to -mindepth 1 -delete && cp -a /from/. /to/'` —
+  then `OL_POSTGRES_VERSION=14-debezium` with the stock compose file. Writes made on 17 are lost.
 
 Both variants were run end to end on a ref-distro demo database (178 MB: `pg_upgrade` 4 s, data identical
 to the 14 baseline, link-mode rollback verified) and link mode additionally on the 121 GB Malawi copy.
@@ -225,19 +295,23 @@ to the 14 baseline, link-mode rollback verified) and link mode additionally on t
 Use it only when the database has no large objects or is small, or when the volume cannot be re-laid out.
 Everything between the start of the dump and the end of the restore is downtime. Run every `pg_dump` /
 `pg_restore` below from the 17 container against the 14 server (`-h <14 host>`): `--compress=lz4` needs
-pg_dump 16+ and `--transaction-size` needs pg_restore 17.
+pg_dump 16+ and `--transaction-size` needs pg_restore 17. Keep the dump files on a host directory bind-mounted
+into that container (`-v /backup:/dump`), not in the container's filesystem.
 
-1. Start an empty 17 container (`openlmis/postgres:17`, a fresh volume), create the roles
-   (`pg_dumpall --globals-only` from 14, filtered) and the database.
+1. Start an empty 17 container (`openlmis/postgres:17`, a fresh volume). Its init script already creates
+   `open_lmis` with `postgis` and `uuid-ossp`, so only the roles are missing — apply them without the
+   superuser the image created:
+   `pg_dumpall -h <14 host> -U postgres --globals-only | grep -v '^CREATE ROLE postgres;' | psql -U postgres`.
 2. Tables: `pg_dump -Fd -j 8 --compress=lz4 --no-blobs` from 14, `pg_restore -j 8` into 17
    (7 + 34 minutes for 36 GB compressed / 112 GB restored).
-3. Large objects: `pg_dump -Fc --compress=lz4 -a --exclude-table='*'` from 14 (one connection, one object at
-   a time — 109 minutes for 21 million objects), then restore **only the large-object entries**:
+3. Large objects: `pg_dump -Fc --compress=lz4 -a --exclude-table='*.*'` from 14 (one connection, one
+   object at a time — 109 minutes for 21 million objects), then restore **only the large-object entries**:
    `pg_restore -l lobs.dump | grep -E ' BLOBS? ' > lobs.list`, then
    `pg_restore -d open_lmis -L lobs.list --transaction-size=1000 lobs.dump`
    (136 minutes). Do not use the `-n <nonexistent> -b` recipe from older guides — pg_dump 17 refuses it
-   ("no matching schemas were found"), and `--exclude-table='*'` may still include table data depending on
-   the user and search path, hence the list filter.
+   ("no matching schemas were found"). The pattern must be `'*.*'`: a bare `'*'` matches only the schemas
+   on the search path, so the dump also carries the table data of every other schema (10× larger, with
+   `--disable-triggers` warnings); the list filter keeps the restore correct either way.
 4. Extensions, `ANALYZE`, verification as in path A (no reindex needed: the data was rewritten).
 
 Rollback: the 14 container and its volume are untouched until you delete them; point the deployment back.
@@ -366,9 +440,13 @@ of the tables you care about, e.g.
 `select md5(string_agg(h, '' order by h)) from (select md5(t::text) h from <schema>.<table> t) s;`.
 In the OLMIS-8422 tests every path produced identical row counts, sequences, large objects (metadata and
 content) and checksums; the only differences were the PostGIS topology metadata tables rewritten by the
-extension update. Then start the services (Flyway must report no pending migrations), log in, and run
-the main flows (requisition submit/authorize/approve, stock adjustment, order print, a Jasper report,
-notifications).
+extension update. Then start the services and check that Flyway found nothing to do: the services log
+Flyway only at WARN level, so compare `select count(*), max(installed_rank) from <schema>.schema_version`
+(`flyway_schema_history` in the newer services) before and after the start — equal means no pending
+migrations. Note that `spring_profiles_active=demo-data,refresh-db` (the ref-distro default) recreates the
+schemas on every start, so compare the data *before* starting the services on such an instance. Then log
+in and run the main flows (requisition submit/authorize/approve, stock adjustment, order print, a Jasper
+report, notifications).
 
 ### 9. Pitfalls seen in the tests
 
