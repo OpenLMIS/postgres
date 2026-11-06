@@ -22,7 +22,8 @@ start on it anyway, so every deployment switches to `OL_POSTGRES_VERSION=17` as 
 | `14-debezium` | `debezium/postgres:14` (Debian bullseye) | 14.x | 3.5 |
 | `12-debezium` | `debezium/postgres:12` (Debian bullseye) | 12.x | 3.x |
 
-Build and publish the image and the upgrade helper `openlmis/postgres-upgrade:14-to-17` (section 3).
+Build and publish the image and the upgrade helper `openlmis/postgres-upgrade:14-to-17` (used in section 3,
+step 3).
 The helper is published too, so that every site upgrades with the same tested tool instead of a local
 build from floating package versions; it is built after the image because it starts
 `FROM openlmis/postgres:17`:
@@ -139,7 +140,7 @@ Then:
 
 | Path | Application downtime | Total elapsed | Notes |
 |---|---|---|---|
-| A. Docker `pg_upgrade` | link mode ~47 min (+ ~11 min analyze and reindex); copy mode: 21 min for the 78 GB SELV database without large objects, of which ~17 min is the file copy (~4.6 GB/min on a default gp3 volume, 3000 IOPS / 125 MB/s) — expect ~26 min of copy for 121 GB, more on slower disks | ~1 h | copy mode keeps the old volume intact; link mode: no data copy, old cluster unusable after the new one starts |
+| A. Docker `pg_upgrade` | link mode ~46 min (+ ~11 min analyze and reindex); copy mode: 21 min for the 78 GB SELV database without large objects, of which ~17 min is the file copy (~4.6 GB/min on a default gp3 volume, 3000 IOPS / 125 MB/s) — expect ~26 min of copy for 121 GB, more on slower disks | ~1 h | copy mode keeps the old volume intact; link mode: no data copy, old cluster unusable after the new one starts |
 | B. Docker dump/restore | ~4.8 h | ~4.8 h | 109 min dump + 136 min restore of the large objects alone; ~45 min without large objects |
 | C. Docker logical replication | ~3 min | ~45 min | 37 min initial sync while production runs; manual copy of large objects and sequences |
 | RDS in-place (Modify) | ~35 min | ~44–47 min to `available` | planner statistics are not carried over: `vacuumdb --analyze-in-stages` after `available` (~30 min on the freshly upgraded 142 GB instance); extensions updated in seconds |
@@ -189,7 +190,7 @@ starting (preloaded libraries the image does not ship). Carry the deliberate val
    from `Dockerfile.upgrade` only when the tag is not available to you). It is the 17 image plus the 14
    binaries and PostGIS for 14: the 17 side is pinned to the image's PostGIS version, the 14 side gets
    whichever 3.x PGDG shipped at build time, which may be newer than the 17 side (3.7.0 vs 3.6.4 in the
-   published build — expected and harmless): `pg_upgrade` only needs `postgis-3` to exist on both sides,
+   build tested in November 2026 — expected and harmless): `pg_upgrade` only needs `postgis-3` to exist on both sides,
    the catalog is updated to the image's version in step 5:
 
    ```bash
@@ -567,7 +568,7 @@ After the upgrade, before application writes resume:
    application is up, re-check the publication table count (path A, step 9).
 
 If writes could not be blocked between steps 3 and 6, use `FORCE=1 SKIP_DBT=1 make recover-slot` instead
-of step 6: it re-snapshots every captured table (30–60 minutes for the Malawi tables); run
+of step 6: it re-snapshots every captured table (30–65 minutes for the Malawi tables); run
 `make initial-dbt-build` only after the snapshot has finished (row counts per table, not the connector
 state). Each re-snapshot appends a full copy to the raw tables; purge the previous snapshot's `op = 'r'`
 rows afterwards or the staging models will outgrow the ClickHouse memory limit.
